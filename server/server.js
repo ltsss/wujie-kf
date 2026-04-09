@@ -1,9 +1,72 @@
 // 自建客服系统 - 服务端
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
 const PORT = 3001;
+
+// Dify 配置
+const DIFY_CONFIG = {
+  apiKey: 'app-2wNgRmooOPx0GZevdxwKMYor',
+  apiUrl: 'https://api.dify.ai/v1'
+};
+
+// fetch polyfill
+function fetch(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const client = urlObj.protocol === 'https:' ? https : http;
+    
+    const req = client.request(url, {
+      method: options.method || 'GET',
+      headers: options.headers || {}
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          json: () => Promise.resolve(JSON.parse(data)),
+          text: () => Promise.resolve(data)
+        });
+      });
+    });
+    
+    req.on('error', reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+// 调用 Dify AI
+async function callDifyAI(message, userId) {
+  try {
+    const response = await fetch(`${DIFY_CONFIG.apiUrl}/chat-messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${DIFY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        inputs: {},
+        query: message,
+        response_mode: 'blocking',
+        conversation_id: '',
+        user: userId
+      })
+    });
+
+    if (!response.ok) throw new Error('Dify API error');
+    
+    const data = await response.json();
+    return data.answer;
+  } catch (error) {
+    console.error('Dify 调用失败:', error.message);
+    return '抱歉，我暂时无法回答，请稍后再试。';
+  }
+}
 
 // 内存存储
 const storage = {
@@ -120,6 +183,46 @@ const server = http.createServer((req, res) => {
         };
         
         conversation.messages.push(message);
+        
+        // 如果是用户消息，调用 Dify AI 回复
+        if (senderType === 'user') {
+          (async () => {
+            const aiReply = await callDifyAI(content, senderId);
+            
+            // 检查是否转人工
+            if (aiReply.includes('[TRANSFER]')) {
+              // 转人工：分配给客服
+              const agent = findAvailableAgent();
+              if (agent) {
+                conversation.agentId = agent.id;
+                conversation.status = 'active';
+                agent.currentSessions++;
+              }
+              
+              const cleanReply = aiReply.replace('[TRANSFER]', '').trim();
+              const aiMessage = {
+                id: 'msg_' + Date.now(),
+                conversationId,
+                senderType: 'agent',
+                senderId: 'ai',
+                content: cleanReply,
+                timestamp: new Date()
+              };
+              conversation.messages.push(aiMessage);
+            } else {
+              // AI 直接回复
+              const aiMessage = {
+                id: 'msg_' + Date.now(),
+                conversationId,
+                senderType: 'agent',
+                senderId: 'ai',
+                content: aiReply,
+                timestamp: new Date()
+              };
+              conversation.messages.push(aiMessage);
+            }
+          })();
+        }
         
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, message }));
